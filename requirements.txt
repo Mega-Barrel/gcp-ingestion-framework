@@ -1,0 +1,7 @@
+
+PyYAML
+google-cloud-storage
+google-cloud-bigquery
+apache-airflow
+apache-airflow-providers-google
+google-auth
