@@ -1,0 +1,40 @@
+
+owner: saurabh_joshi
+description: "DAG that ingests data base on ingestion processor"
+retries: 1
+schedule_interval: "0 2 * * *"
+tags:
+    - audit
+    - sample
+
+audit:
+  audit_dataset: rmdw_reject
+  audit_table: ingestion_audit
+
+load_type: bqload
+conn_id: "gcp-conn"
+compute_project: "analytics-engineering-101"
+bucket_name: globallandingzone-asia-south1
+
+tasks:
+  - task_name: product_sales
+    job_name: product_sales
+    file_name_pattern: product_sales
+    delimited_file_props:
+      delimiter: ','
+      row_delimiter: '\n'
+      footer_exists: False
+      has_header: True
+      escapechar: ''
+    targets:
+      - bigquery:
+          has_header: True
+          target_dataset: rmdw_tables
+          target_table: product_sales_data
+          write_disposition: WRITE_APPEND
+          schema_evolution_enabled: True
+          jagged_rows_allowed: True
+
+xcom_task_details:
+  task_id: "product_sales_load_preprocess"
+  key: "product_sales_load_file_path_ds"
