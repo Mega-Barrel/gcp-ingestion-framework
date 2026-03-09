@@ -6,3 +6,4 @@ plugins/
 credentials.json
 
 env/
+.env
