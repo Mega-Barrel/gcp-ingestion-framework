@@ -11,11 +11,7 @@ from typing import Dict, List
 from google.cloud import bigquery
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
-# Workaround
 from typing import cast
-import json
-from airflow.hooks.base import BaseHook
-from google.oauth2 import service_account
 
 from ingestors.utility.audits.bq_audit import BQAuditManager
 from ..utility.base_processor import BaseProcessor
@@ -46,25 +42,8 @@ class BQLoadProcessor(BaseProcessor):
         self.project_id = config.get("compute_project")
         self.conn_id = config.get("conn_id", "gcp-conn")
 
-        # workaround
-        connection = BaseHook.get_connection(self.conn_id)
-        try:
-            key_info = connection.extra_dejson 
-            if not key_info or "private_key" not in str(key_info):
-                key_info = json.loads(connection.extra)
-        except Exception as e:
-            logger.error("Failed to extract credentials for BQ: %s", e)
-            raise
-        credentials = service_account.Credentials.from_service_account_info(key_info)
-
         self.hook = BigQueryHook(gcp_conn_id = self.conn_id)
-
-        # workaround
-        def manual_auth():
-            return credentials, self.project_id
-        self.hook.get_credentials_and_project_id = manual_auth
-
-        super().__init__(client = self.hook.get_client(), conn_id = self.conn_id)
+        self.client = self.hook.get_client(project_id = self.project_id)
 
         audit_cfg = config.get("audit", {})
         audit_table = (
