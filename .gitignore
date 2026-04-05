@@ -3,7 +3,7 @@ dags/
 include/
 plugins/
 
-credentials.json
+src/astro_dags/include/credentials.json
 
 env/
 .env
