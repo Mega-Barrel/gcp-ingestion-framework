@@ -4,15 +4,15 @@ description: "DAG that ingests data base on ingestion processor"
 retries: 1
 schedule_interval: "0 2 * * *"
 tags:
-    - audit
-    - sample
+  - audit
+  - sample
 
 audit:
   audit_dataset: rmdw_reject
   audit_table: ingestion_audit
 
 load_type: bqload
-conn_id: "gcp-conn"
+conn_id: "gcp_conn"
 compute_project: "analytics-engineering-101"
 bucket_name: globallandingzone-asia-south1
 
