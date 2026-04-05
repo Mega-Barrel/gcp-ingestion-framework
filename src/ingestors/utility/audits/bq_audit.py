@@ -7,7 +7,6 @@ from typing import Optional
 
 from google.cloud import bigquery
 
-
 class BQAuditManager:
     """
     Handles logging of job statuses (RUNNING, COMPLETED, FAILED) to BigQuery.
