@@ -1,80 +1,119 @@
-
 import os
+import sys
+import csv
+import json
 import logging
-import uuid
+from datetime import datetime, timezone
 from google.cloud import bigquery
+from google.cloud import storage
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level = logging.INFO,
+    format = '%(asctime)s - %(levelname)s - %(message)s'
+)
 
-def trigger_cloud_run_job():
-    project_id = os.environ["PROJECT_ID"]
-    source_uri = os.environ["FILE_URI"]
-    target_table = os.environ["TARGET_TABLE_ID"]
+def process_single_file(bq_client, storage_client, source_uri, file_props, target_props, project_id):
+    delimiter = file_props.get("delimiter", ",")
+    has_header = file_props.get("has_header", True)
+    allow_jagged = target_props.get("jagged_rows_allowed", True)
+    target_table_id = f"{project_id}.{target_props['target_dataset']}.{target_props['target_table']}"
+    
+    bucket_name = source_uri.split("/")[2]
+    blob_name = "/".join(source_uri.split("/")[3:])
+    file_name = blob_name.split("/")[-1]
 
-    file_path = "/".join(source_uri.split("/")[3:])
-    file_name = file_path.split("/")[-1]
+    file_metrics = {
+        "file_name": file_name,
+        "processed_records": 0,
+        "invalid_records": 0,
+        "status": "SUCCESS",
+        "error": None
+    }
 
-    dataset_id = target_table.split(".")[1]
-    staging_table = f"{project_id}.{dataset_id}.staging_{uuid.uuid4().hex[:8]}"
-
-    bq_client = bigquery.Client(project=project_id)
+    local_path = f"/tmp/{file_name}"
 
     try:
-        logging.info(f"Starting direct BigQuery ELT ingestion for {source_uri}")
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.download_to_filename(local_path)
 
-        target_table_def = bq_client.get_table(target_table)
+        rows_to_stream = []
+        batch_size = 5000
 
-        file_schema = target_table_def.schema[:-2]
+        with open(local_path, mode='r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter=delimiter)
 
-        job_config = bigquery.LoadJobConfig(
-            source_format = bigquery.SourceFormat.CSV,
-            field_delimiter = "|",
-            autodetect = False,
-            schema = file_schema,
-            skip_leading_rows = 1,
-            write_disposition = bigquery.WriteDisposition.WRITE_TRUNCATE
-        )
+            table = bq_client.get_table(target_table_id)
+            schema_cols = [field.name for field in table.schema if field.name not in ['file_name', 'insert_ts']]
+            expected_count = len(schema_cols)
 
-        logging.info(f"Loading raw data into staging table: {staging_table}")
-        load_job = bq_client.load_table_from_uri(
-            source_uri, staging_table, job_config=job_config
-        )
-        load_job.result()
+            if has_header:
+                next(reader)
 
-        loaded_rows = load_job.output_rows
-        logging.info(f"DQ Check: Staging table successfully loaded with {loaded_rows} rows.")
+            for row in reader:
+                # DQ Check: Compare actual row length to BigQuery schema length
+                if not allow_jagged and len(row) != expected_count:
+                    file_metrics["invalid_records"] += 1
+                    continue
 
-        if loaded_rows == 0:
-            raise ValueError(f"Data Quality Alert: Source file {file_name} is empty. Aborting insertion.")
+                # Dynamic row-level timestamp
+                row_ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
-        query = f"""
-            INSERT INTO `{target_table}`
-            SELECT 
-                *,
-                @file_name AS file_name,
-                CURRENT_TIMESTAMP() AS insert_ts
-            FROM `{staging_table}`
-        """
+                # Handle Jagged Rows (Padding/Truncating)
+                if len(row) < len(schema_cols):
+                    row += [None] * (len(schema_cols) - len(row))
 
-        query_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("file_name", "STRING", file_name)
-            ]
-        )
+                row_dict = dict(zip(schema_cols, row[:len(schema_cols)]))
 
-        logging.info("Appending audit columns and moving to target partitioned table...")
-        query_job = bq_client.query(query, job_config=query_config)
-        query_job.result()
+                row_dict['file_name'] = file_name
+                row_dict['insert_ts'] = row_ts
 
-        logging.info(f"Successfully processed and loaded {loaded_rows} rows into {target_table}")
+                rows_to_stream.append(row_dict)
+
+                if len(rows_to_stream) >= batch_size:
+                    errors = bq_client.insert_rows_json(target_table_id, rows_to_stream)
+                    if errors:
+                        raise RuntimeError(f"BQ Streaming error: {errors}")
+                    file_metrics["processed_records"] += len(rows_to_stream)
+                    rows_to_stream = []
+
+            if rows_to_stream:
+                errors = bq_client.insert_rows_json(target_table_id, rows_to_stream)
+                if errors:
+                    raise RuntimeError(f"BQ Streaming error: {errors}")
+                file_metrics["processed_records"] += len(rows_to_stream)
 
     except Exception as e:
-        logging.error(f"Ingestion pipeline failed: {str(e)}")
-        raise
-
+        file_metrics["status"] = "FAILED"
+        file_metrics["error"] = str(e)
+        logging.error(f"Error processing {file_name}: {str(e)}")
     finally:
-        logging.info("Cleaning up staging table...")
-        bq_client.delete_table(staging_table, not_found_ok=True)
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+    return file_metrics
+
+def main():
+    project_id = os.environ.get("PROJECT_ID")
+    source_uris = os.environ.get("FILE_URI", "").split(",")
+    file_props = json.loads(os.environ.get("FILE_PROPS", "{}"))
+    target_props = json.loads(os.environ.get("TARGET_PROPS", "{}"))
+
+    bq_client = bigquery.Client(project=project_id)
+    storage_client = storage.Client(project=project_id)
+
+    results = []
+    for uri in source_uris:
+        if not uri.strip():
+            continue
+        logging.info(f"Triggering ingestion for: {uri}")
+        report = process_single_file(bq_client, storage_client, uri, file_props, target_props, project_id)
+        results.append(report)
+
+    print(f"JOB_RESULT:{json.dumps(results)}")
+
+    if any(r["status"] == "FAILED" for r in results):
+        sys.exit(1)
 
 if __name__ == "__main__":
-    trigger_cloud_run_job()
+    main()
